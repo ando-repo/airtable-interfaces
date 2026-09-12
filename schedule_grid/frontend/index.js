@@ -1524,6 +1524,30 @@ function ScheduleGridApp() {
         publicationsTable && publicationPeriodeField && publicationContenuField,
     );
 
+    // Silence is the wrong answer here. With the row hidden and nothing said, a misconfigured
+    // extension looks identical to one where the feature was never wanted — which is exactly how
+    // a missing table wastes an afternoon. Said only once a table IS picked: an extension that
+    // does not publish at all should stay quiet.
+    const publishDiagnostic = useMemo(() => {
+        if (!periodesTable && !publicationsTable) return null;
+        const missing = [];
+        if (!periodesTable) missing.push('la table Périodes');
+        else {
+            if (!periodeDebutField) missing.push('« Premier jour de la période »');
+            if (!periodeFinField) missing.push('« Dernier jour de la période »');
+        }
+        if (!publicationsTable) missing.push('la table Publications');
+        else {
+            if (!publicationPeriodeField) missing.push('« Lien Période »');
+            if (!publicationContenuField) missing.push('« Contenu de l’instantané »');
+        }
+        if (!missing.length) return null;
+        return `Publication indisponible : ${missing.join(', ')} ${missing.length > 1 ? 'ne sont pas renseignés' : 'n’est pas renseigné'} dans les réglages. Une table créée après la configuration de l’extension doit d’abord être ajoutée au panneau Données pour y apparaître.`;
+    }, [
+        periodesTable, periodeDebutField, periodeFinField,
+        publicationsTable, publicationPeriodeField, publicationContenuField,
+    ]);
+
     const periodes = useMemo(() => {
         if (!periodesTable || !periodeDebutField || !periodeFinField) return [];
         return periodeRecords
@@ -2163,6 +2187,20 @@ function ScheduleGridApp() {
 
             {/* Publishing row. The period is picked explicitly — the grid navigates in 1- or
                 2-week steps, so publishing "what is displayed" would cut a period in half. */}
+            {publishDiagnostic && (
+                <div className="mb-3 rounded border border-yellow-yellow bg-yellow-yellowLight2 px-3 py-2 text-xs text-gray-gray900">
+                    {publishDiagnostic}
+                </div>
+            )}
+
+            {canPublish && !effectivePeriode && (
+                <div className="mb-3 rounded border border-yellow-yellow bg-yellow-yellowLight2 px-3 py-2 text-xs text-gray-gray900">
+                    Publication indisponible : aucune période lisible dans « {periodesTable.name} ».
+                    Vérifiez que les champs de dates sont visibles pour l’extension et que la table
+                    contient les périodes de la convention.
+                </div>
+            )}
+
             {canPublish && effectivePeriode && (
                 <div className="mb-3 flex flex-wrap items-center gap-2 rounded border border-gray-gray200 bg-gray-gray50 px-3 py-2 dark:border-gray-gray700 dark:bg-gray-gray800">
                     <label className="text-sm font-medium">Période</label>
