@@ -156,6 +156,23 @@ montage and démontage. Publishing the whole span would put in front of a placie
 block that means nothing to them. If the chosen block is not configured, the snapshot falls back
 to the widest span rather than publishing no hours at all.
 
+**Restaurer une version** puts the live quarts back to a saved state. It is a **true restore**:
+the shifts of that version are put back, the ones deleted since are recreated, and **the ones
+created since are deleted** — the period ends up exactly as it was saved. The panel states the
+three counts before acting and the button arms on a first click, like deleting a shift; all three
+permissions are checked up front, because a restore that stops halfway leaves the period in a state
+that is neither the saved one nor the one before.
+
+**Restoring does not publish.** The portal keeps showing the last publication until someone clicks
+Sauvegarder: restoring is a correction to the working schedule, and whether employees should see it
+is a separate decision.
+
+For that to work the snapshot carries record ids (quart, contact, rôle, événement) and **all three
+In/Out pairs in raw seconds**, not only the published one — writing back the show call alone would
+silently wipe the montage a technical crew had entered. **A version published before those ids
+existed cannot be restored**, and the panel says so rather than failing oddly: a name cannot
+rebuild a link, since two contacts can share one and a role can be renamed.
+
 Configured by **Table Périodes** (libellé / premier jour / dernier jour) and **Table Publications**
 (libellé / lien Période / date / publié par / contenu). Leave either table unset and the row does
 not appear — the grid behaves exactly as before.

@@ -179,6 +179,24 @@ function fmtHHMM(seconds) {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+// Parse a published snapshot back into rows. Returns null when the text is not a snapshot at all,
+// and an empty array for a version published before snapshots carried record ids — those cannot be
+// restored, because a name cannot rebuild a link: two contacts can share one, a role can be
+// renamed, and a quart is identified by nothing else.
+function parseSnapshot(text) {
+    try {
+        const parsed = JSON.parse(String(text ?? ''));
+        if (!Array.isArray(parsed)) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function isRestorable(rows) {
+    return Array.isArray(rows) && rows.length > 0 && rows.every((r) => typeof r?.quartId === 'string');
+}
+
 // Label the window an employee submitted from the portal. Either bound may be missing, which the
 // portal treats as unbounded rather than as midnight.
 function fmtAvailabilityWindow({start, end}) {
@@ -1609,6 +1627,94 @@ function ScheduleGridApp() {
         publicationDateField, publicationAuteurField, effectivePeriode,
     ]);
 
+    // Every version of the selected period, newest first. Few per period, so their snapshots are
+    // parsed eagerly: the restore panel needs to say which ones can be restored at all.
+    const versions = useMemo(() => {
+        if (!publicationsTable || !publicationPeriodeField || !effectivePeriode) return [];
+        return publicationRecords
+            .filter((r) => readLinkedIds(r, publicationPeriodeField).includes(effectivePeriode.id))
+            .map((r) => {
+                const rows = publicationContenuField
+                    ? parseSnapshot(r.getCellValueAsString(publicationContenuField))
+                    : null;
+                return {
+                    id: r.id,
+                    at: publicationDateField ? readDateTime(r, publicationDateField) : null,
+                    by: publicationAuteurField
+                        ? r.getCellValueAsString(publicationAuteurField).trim()
+                        : '',
+                    rows,
+                    restorable: isRestorable(rows),
+                };
+            })
+            .sort((a, b) => (b.at?.getTime() ?? 0) - (a.at?.getTime() ?? 0));
+    }, [
+        publicationsTable, publicationRecords, publicationPeriodeField,
+        publicationDateField, publicationAuteurField, publicationContenuField, effectivePeriode,
+    ]);
+
+    // What restoring a version would do to the live quarts. Computed before anything is written so
+    // the panel can state it: a restore deletes, and a count is the last chance to notice.
+    const buildRestorePlan = useCallback(
+        (rows, periode) => {
+            const wanted = new Map(rows.map((r) => [r.quartId, r]));
+            const present = new Map();
+            for (const r of staffRecords) {
+                const date = readShiftDate(r);
+                if (date && date >= periode.debut && date <= periode.fin) present.set(r.id, r);
+            }
+            return {
+                aRemettre: [...wanted.values()].filter((r) => present.has(r.quartId)),
+                aRecreer: [...wanted.values()].filter((r) => !present.has(r.quartId)),
+                aSupprimer: [...present.values()].filter((r) => !wanted.has(r.id)),
+            };
+        },
+        [staffRecords, readShiftDate],
+    );
+
+    // Field values for one snapshot row, shared by the update and the create paths so a restored
+    // quart and a recreated one cannot drift apart.
+    const restoreFields = useCallback(
+        (row) => {
+            const fields = {};
+            if (canAssignContact) {
+                fields[contactLinkField.id] = row.contactId ? [{id: row.contactId}] : [];
+            }
+            if (isRoleWritable(categoryField)) {
+                fields[categoryField.id] = roleWriteValue(
+                    categoryField,
+                    row.roleId ? {id: row.roleId, name: row.role} : null,
+                    row.role,
+                ) ?? null;
+            }
+            if (staffEventLinkField) {
+                fields[staffEventLinkField.id] = row.evenementId ? [{id: row.evenementId}] : [];
+            }
+            if (staffProjectLinkField && detailLinkField) {
+                const ev = row.evenementId
+                    ? eventRecords.find((r) => r.id === row.evenementId)
+                    : null;
+                const projectIds = ev ? readLinkedIds(ev, detailLinkField) : [];
+                fields[staffProjectLinkField.id] = projectIds.map((id) => ({id}));
+            }
+            // Written even when null: a pair the version had empty must come back empty, or the
+            // restore would leave hours nobody put there.
+            for (const [key, value] of Object.entries(row.heures ?? {})) {
+                const field = customPropertyValueByKey[key];
+                if (field) fields[field.id] = value ?? null;
+            }
+            if (staffDateWriteField && row.date) {
+                fields[staffDateWriteField.id] = row.date;
+            }
+            return fields;
+        },
+        [
+            canAssignContact, contactLinkField, categoryField, staffEventLinkField,
+            staffProjectLinkField, detailLinkField, eventRecords, customPropertyValueByKey,
+            staffDateWriteField,
+        ],
+    );
+
     // The frozen copy the portal will render. Built from what is on screen at click time, never
     // read again afterwards: a later edit to a shift does not change a publication.
     const buildSnapshot = useCallback(
@@ -1648,7 +1754,19 @@ function ScheduleGridApp() {
                             ? []
                             : outFields.map((f) => readDurationSeconds(r, f)).filter((v) => v !== null);
 
+                // Every pair in raw seconds, not only the published one: restoring a version
+                // must put the whole quart back, and writing only the show call would silently
+                // wipe the montage and démontage a technical crew had entered.
+                const heures = {};
+                for (const sp of SHIFT_PAIRS) {
+                    const fIn = customPropertyValueByKey[sp.inKey];
+                    const fOut = customPropertyValueByKey[sp.outKey];
+                    if (fIn) heures[sp.inKey] = readDurationSeconds(r, fIn);
+                    if (fOut) heures[sp.outKey] = readDurationSeconds(r, fOut);
+                }
+
                 rows.push({
+                    // --- Shown to employees. Display text, never used to restore. ---
                     date: fmtDate(date),
                     evenement: label ? splitEventLabel(label).title : '',
                     salle:
@@ -1659,6 +1777,16 @@ function ScheduleGridApp() {
                     nom: r.getCellValueAsString(contactField).trim(),
                     debut: ins.length ? fmtHHMM(Math.min(...ins)) : '',
                     fin: outs.length ? fmtHHMM(Math.max(...outs)) : '',
+
+                    // --- What a restore needs. Names cannot rebuild a link: two contacts can
+                    // share one, a role can be renamed, and a quart is identified by nothing
+                    // else. Ids are recorded even though nothing reads them yet, because a
+                    // version published without them can never be restored. ---
+                    quartId: r.id,
+                    contactId: readLinkedIds(r, contactLinkField)[0] ?? null,
+                    roleId: readLinkedIds(r, categoryField)[0] ?? null,
+                    evenementId: eventId,
+                    heures,
                 });
             }
             rows.sort(
@@ -1671,7 +1799,7 @@ function ScheduleGridApp() {
         },
         [
             staffRecords, eventRecords, readShiftDate, staffEventLinkField, eventLabelField,
-            salleField, categoryField, contactField, inFields, outFields,
+            salleField, categoryField, contactField, contactLinkField, inFields, outFields,
             publishedPair, customPropertyValueByKey,
         ],
     );
@@ -1852,6 +1980,90 @@ function ScheduleGridApp() {
             await eventsTable.updateRecordAsync(record, fields);
         } catch (err) {
             setFeedback({type: 'error', message: `Échec Portail : ${err.message}`});
+        }
+    };
+
+    const openRestorePanel = () => {
+        setFeedback(null);
+        const restaurables = versions.filter((v) => v.restorable);
+        setPanel({
+            mode: 'restore',
+            versionId: restaurables[0]?.id ?? versions[0]?.id ?? null,
+            confirmRestore: false,
+        });
+    };
+
+    const handleRestore = async () => {
+        const version = versions.find((v) => v.id === panel.versionId);
+        if (!version || !effectivePeriode) return;
+        if (!version.restorable) {
+            setFeedback({
+                type: 'error',
+                message: 'Cette version a été publiée avant que les instantanés ne portent les identifiants des quarts. Elle reste consultable, mais ne peut pas être restaurée.',
+            });
+            return;
+        }
+
+        const plan = buildRestorePlan(version.rows, effectivePeriode);
+
+        // Checked up front, all three: a restore that stops halfway leaves the period in a state
+        // that is neither the saved one nor the one before — the worst of both.
+        const refus = [];
+        if (plan.aRemettre.length && !staffTable.hasPermissionToUpdateRecord()) refus.push('modifier');
+        if (plan.aRecreer.length && !staffTable.hasPermissionToCreateRecord()) refus.push('créer');
+        if (plan.aSupprimer.length && !staffTable.hasPermissionToDeleteRecord()) refus.push('supprimer');
+        if (refus.length) {
+            setFeedback({
+                type: 'error',
+                message: `Restauration impossible : Airtable refuse de ${refus.join(', ')} des quarts. Activez ces actions sur l’élément d’extension.`,
+            });
+            return;
+        }
+
+        // Destructive: arm on a first click, act on a second. Same rule as deleting a shift.
+        if (!panel.confirmRestore) {
+            setPanel({...panel, confirmRestore: true});
+            return;
+        }
+
+        setSaving(true);
+        let remis = 0;
+        let recrees = 0;
+        let supprimes = 0;
+        try {
+            const updates = plan.aRemettre.map((row) => ({
+                id: row.quartId,
+                fields: restoreFields(row),
+            }));
+            for (const chunk of chunkArray(updates, MAX_RECORDS_PER_CALL)) {
+                await staffTable.updateRecordsAsync(chunk);
+                remis += chunk.length;
+            }
+
+            const creations = plan.aRecreer.map((row) => ({fields: restoreFields(row)}));
+            for (const chunk of chunkArray(creations, MAX_RECORDS_PER_CALL)) {
+                await staffTable.createRecordsAsync(chunk);
+                recrees += chunk.length;
+            }
+
+            const deletions = plan.aSupprimer.map((r) => r.id);
+            for (const chunk of chunkArray(deletions, MAX_RECORDS_PER_CALL)) {
+                await staffTable.deleteRecordsAsync(chunk);
+                supprimes += chunk.length;
+            }
+
+            setPanel(null);
+            setFeedback({
+                type: 'success',
+                message: `Version restaurée : ${remis} quart(s) remis, ${recrees} recréé(s), ${supprimes} supprimé(s). Le portail montre toujours la dernière publication — cliquez Sauvegarder pour que les employés voient cet état.`,
+            });
+        } catch (err) {
+            setFeedback({
+                type: 'error',
+                message: `Restauration interrompue après ${remis} remis, ${recrees} recréé(s), ${supprimes} supprimé(s) : ${err.message}`,
+            });
+        } finally {
+            setSaving(false);
         }
     };
 
@@ -2225,6 +2437,17 @@ function ScheduleGridApp() {
                         {saving ? 'Publication…' : 'Sauvegarder'}
                     </button>
 
+                    {versions.length > 0 && (
+                        <button
+                            type="button"
+                            onClick={openRestorePanel}
+                            disabled={saving}
+                            className="rounded border border-gray-gray300 bg-white px-3 py-1 text-sm dark:border-gray-gray600 dark:bg-gray-gray800 dark:text-gray-gray100 disabled:opacity-50"
+                        >
+                            Restaurer une version…
+                        </button>
+                    )}
+
                     <span className="text-xs text-gray-gray600 dark:text-gray-gray400">
                         {lastPublication ? (
                             <>
@@ -2313,6 +2536,19 @@ function ScheduleGridApp() {
                     roleDiagnostic={roleDiagnostic}
                     categoryField={categoryField}
                     writablePairs={writablePairs}
+                />
+            )}
+
+            {panel?.mode === 'restore' && effectivePeriode && (
+                <RestorePanel
+                    panel={panel}
+                    setPanel={setPanel}
+                    saving={saving}
+                    onSubmit={handleRestore}
+                    onCancel={() => setPanel(null)}
+                    versions={versions}
+                    periode={effectivePeriode}
+                    buildRestorePlan={buildRestorePlan}
                 />
             )}
 
@@ -2762,6 +2998,81 @@ function CreateShiftsPanel({
 
             {/* No event picker here: shifts are created for a day and dispatched to an event later,
                 from the assignment panel. */}
+        </PanelShell>
+    );
+}
+
+/**
+ * Restore a published version onto the live quarts. Destructive by design — the point is that the
+ * period ends up exactly as it was saved — so the panel states the three counts before acting and
+ * the button arms on a first click, like deleting a shift.
+ *
+ * It does not publish. The portal keeps showing the last publication until someone clicks
+ * Sauvegarder: restoring is a correction to the working schedule, and whether employees should see
+ * it is a separate decision.
+ */
+function RestorePanel({
+    panel, setPanel, saving, onSubmit, onCancel, versions, periode, buildRestorePlan,
+}) {
+    const version = versions.find((v) => v.id === panel.versionId) ?? null;
+    const plan = version?.restorable ? buildRestorePlan(version.rows, periode) : null;
+
+    return (
+        <PanelShell
+            title="Restaurer une version"
+            saving={saving}
+            submitLabel={panel.confirmRestore ? 'Confirmer la restauration' : 'Restaurer'}
+            onSubmit={onSubmit}
+            onCancel={onCancel}
+        >
+            <div>
+                <label className={FIELD_LABEL}>Version</label>
+                <select
+                    className={FIELD_INPUT}
+                    value={panel.versionId ?? ''}
+                    onChange={(e) =>
+                        setPanel({...panel, versionId: e.target.value, confirmRestore: false})
+                    }
+                >
+                    {versions.map((v) => (
+                        <option key={v.id} value={v.id}>
+                            {v.at ? `${fmtDate(v.at)} ${fmtHHMM(v.at.getHours() * 3600 + v.at.getMinutes() * 60)}` : 'sans date'}
+                            {v.by ? ` — ${v.by}` : ''}
+                            {v.restorable ? '' : ' (non restaurable)'}
+                        </option>
+                    ))}
+                </select>
+            </div>
+
+            {version && !version.restorable && (
+                <p className="max-w-[18rem] text-xs text-orange-orange">
+                    Cette version a été publiée avant que les instantanés ne portent les
+                    identifiants des quarts. Elle reste lisible dans Airtable, mais rien ne permet
+                    de la rejouer : un nom ne reconstitue pas un lien.
+                </p>
+            )}
+
+            {plan && (
+                <div className="max-w-[18rem] text-xs text-gray-gray700 dark:text-gray-gray300">
+                    <p className="mb-1 font-medium">Ce que la restauration fera :</p>
+                    <ul className="ml-4 list-disc">
+                        <li>{plan.aRemettre.length} quart(s) remis à l’état sauvegardé</li>
+                        <li>{plan.aRecreer.length} quart(s) recréé(s)</li>
+                        <li className={plan.aSupprimer.length ? 'font-semibold text-orange-orange' : ''}>
+                            {plan.aSupprimer.length} quart(s) créé(s) depuis seront supprimés
+                        </li>
+                    </ul>
+                    <p className="mt-2">
+                        Le portail continuera d’afficher la dernière publication : cliquez
+                        Sauvegarder ensuite pour que les employés voient cet état.
+                    </p>
+                    {panel.confirmRestore && (
+                        <p className="mt-2 font-semibold text-orange-orange">
+                            Cliquez de nouveau pour confirmer. Cette opération ne s’annule pas.
+                        </p>
+                    )}
+                </div>
+            )}
         </PanelShell>
     );
 }
