@@ -1677,7 +1677,9 @@ function ScheduleGridApp() {
     const restoreFields = useCallback(
         (row) => {
             const fields = {};
-            if (canAssignContact) {
+            // Not `canAssignContact`: that is declared further down, and a dependency array is
+            // read at render, so naming it here would throw before the grid ever draws.
+            if (contactsTable && contactLinkField) {
                 fields[contactLinkField.id] = row.contactId ? [{id: row.contactId}] : [];
             }
             if (isRoleWritable(categoryField)) {
@@ -1709,7 +1711,7 @@ function ScheduleGridApp() {
             return fields;
         },
         [
-            canAssignContact, contactLinkField, categoryField, staffEventLinkField,
+            contactsTable, contactLinkField, categoryField, staffEventLinkField,
             staffProjectLinkField, detailLinkField, eventRecords, customPropertyValueByKey,
             staffDateWriteField,
         ],
