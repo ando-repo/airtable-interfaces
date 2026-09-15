@@ -35,6 +35,32 @@ All fields are set from the settings panel; sensible defaults are auto-detected 
 - **Catégorie de contact** + **Catégorie de contact à afficher** (default `Employés`) — Contacts
   also holds producers, venue teams and suppliers, so the rows are narrowed to one category.
 
+## Collective-agreement periods (optional)
+
+Point **Table Périodes** at `periodes_horaire` (Annexe C of the collective agreement) and the matrix
+walks **period by period** instead of week by week: *Période précédente* / *Période à planifier* /
+*Période suivante*, each showing exactly the 14 days Sunday→Saturday the agreement defines.
+
+Without it, a two-week window anchored on the current Sunday straddles two periods half-and-half —
+on Monday 14 September it showed 13→26 September, while the agreement's periods are 6→19 and
+20 September→3 October. The document this replaces was already read that way ("Semaine du
+2026-09-06 au 2026-09-19" is a period, not two arbitrary weeks).
+
+**It opens on the period to schedule**: the next one to start. Between a Saturday deadline and the
+Sunday it opens, that is precisely the period whose availabilities have just frozen and need a
+schedule. It falls back to the period running today, then to the last one.
+
+**A banner says whether the numbers are final**, because the same table means two different things
+depending on the deadline:
+
+- green — *Remise close le samedi 12 septembre à 09 h 00 : ces disponibilités sont figées, l'horaire
+  peut être monté.*
+- yellow — *Remise ouverte jusqu'au … : les disponibilités peuvent encore changer.*
+
+Configured by **Premier jour / Dernier jour de la période** and **Date limite de remise** (the latter
+read as an instant, not a date — the 9:00 is the point). Leave the table unset, or let it hold no
+readable period, and the week view comes back unchanged.
+
 ## Reading it
 
 - **Period** — always starts on a Sunday, so a period reads as whole weeks. 1, 2 (default) or 4

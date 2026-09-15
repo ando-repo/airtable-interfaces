@@ -23,6 +23,10 @@ const DEFAULT_CONTACT_CATEGORY = 'Employés';
 
 const AVAILABILITY_TABLE_NEEDLE = 'disponibilit';
 
+// The collective agreement's periods (Annexe C): a Saturday 9:00 deadline, then 14 days
+// Sunday→Saturday. When present, the matrix walks period by period instead of week by week.
+const PERIODES_TABLE_NEEDLE = 'periodes_horaire';
+
 // === HELPERS ===
 
 // Parse any Airtable date/datetime/formula cell into a local-midnight Date. Null if unparseable.
@@ -113,6 +117,25 @@ function fmtWindow(start, end) {
     return `${fmtHeure(start)} à ${fmtHeure(end)}`;
 }
 
+// Read a date/time cell as an exact instant — readDate normalizes to midnight and would lose the
+// 9:00 of a deadline, which is the whole point of it.
+function readDateTime(record, field) {
+    if (!field) return null;
+    const raw = record.getCellValue(field);
+    const d = raw ? new Date(raw) : null;
+    return d && !isNaN(d.getTime()) ? d : null;
+}
+
+// "dimanche 20 septembre", for prose. ISO stays the format for data.
+function jourLong(date, avecAnnee = false) {
+    return date.toLocaleDateString('fr-CA', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        ...(avecAnnee ? {year: 'numeric'} : {}),
+    });
+}
+
 function readLinkedIds(record, field) {
     if (!field) return [];
     const v = record.getCellValue(field);
@@ -186,6 +209,10 @@ function getCustomProperties(base) {
         base.tables.find((t) => t.id === linkedContactsTableId) ||
         base.tables.find((t) => t.name.toLowerCase().includes('contact'));
 
+    const periodesTable = base.tables.find((t) =>
+        t.name.toLowerCase().includes(PERIODES_TABLE_NEEDLE),
+    );
+
     return [
         {
             key: 'availabilityTable',
@@ -254,6 +281,41 @@ function getCustomProperties(base) {
                 },
             ]
             : []),
+        // Optional. Left unset, the matrix keeps its week-by-week navigation exactly as before.
+        {
+            key: 'periodesTable',
+            label: 'Table Périodes (convention collective)',
+            type: 'table',
+            defaultValue: periodesTable,
+        },
+        ...(periodesTable
+            ? [
+                {
+                    key: 'periodeDebutField',
+                    label: 'Premier jour de la période',
+                    type: 'field',
+                    table: periodesTable,
+                    shouldFieldBeAllowed: isDateLike,
+                    defaultValue: byName(periodesTable, isDateLike, 'debut', 'début'),
+                },
+                {
+                    key: 'periodeFinField',
+                    label: 'Dernier jour de la période',
+                    type: 'field',
+                    table: periodesTable,
+                    shouldFieldBeAllowed: isDateLike,
+                    defaultValue: byName(periodesTable, isDateLike, 'fin'),
+                },
+                {
+                    key: 'periodeLimiteField',
+                    label: 'Date limite de remise',
+                    type: 'field',
+                    table: periodesTable,
+                    shouldFieldBeAllowed: isDateLike,
+                    defaultValue: byName(periodesTable, isDateLike, 'remise', 'limite', 'butoir'),
+                },
+            ]
+            : []),
     ];
 }
 
@@ -270,24 +332,62 @@ function AvailabilityMatrixApp() {
     const contactsTable = customPropertyValueByKey.contactsTable;
     const contactCategoryField = customPropertyValueByKey.contactCategoryField;
     const contactCategoryValue = customPropertyValueByKey.contactCategoryValue;
+    const periodesTable = customPropertyValueByKey.periodesTable;
+    const periodeDebutField = customPropertyValueByKey.periodeDebutField;
+    const periodeFinField = customPropertyValueByKey.periodeFinField;
+    const periodeLimiteField = customPropertyValueByKey.periodeLimiteField;
 
     // useRecords throws on an undefined table, and contactsTable is optional: fall back to a table
     // that always exists and ignore the result when Contacts is not configured.
     const availabilityRecords = useRecords(availabilityTable);
     const contactRecords = useRecords(contactsTable || availabilityTable);
+    const periodeRecords = useRecords(periodesTable || availabilityTable);
 
     const [weekOffset, setWeekOffset] = useState(0);
     const [numWeeks, setNumWeeks] = useState(DEFAULT_NUM_WEEKS);
     const [hideEmpty, setHideEmpty] = useState(false);
+    /** Index in `periodes`; null means "the period to schedule", recomputed as time passes. */
+    const [periodeIndex, setPeriodeIndex] = useState(null);
 
     const configured = Boolean(availabilityTable && dateField && contactLinkField && contactsTable);
 
-    // The window always starts on a Sunday, so a period reads as whole weeks whatever the offset.
+    // The agreement's periods, oldest first. Blank or half-filled rows are dropped rather than
+    // matched against every date.
+    const periodes = useMemo(() => {
+        if (!periodesTable || !periodeDebutField || !periodeFinField) return [];
+        return periodeRecords
+            .map((r) => ({
+                debut: readDate(r, periodeDebutField),
+                fin: readDate(r, periodeFinField),
+                limite: periodeLimiteField ? readDateTime(r, periodeLimiteField) : null,
+            }))
+            .filter((p) => p.debut && p.fin && p.fin >= p.debut)
+            .sort((a, b) => a.debut - b.debut);
+    }, [periodesTable, periodeRecords, periodeDebutField, periodeFinField, periodeLimiteField]);
+
+    // The period the ops director is working on: the next one to start. Between a Saturday
+    // deadline and the Sunday it opens, that is precisely the period whose availabilities have
+    // just frozen and now need a schedule. Falls back to the one running today, then the last.
+    const periodeParDefaut = useMemo(() => {
+        if (!periodes.length) return null;
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const next = periodes.findIndex((p) => p.debut > today);
+        if (next !== -1) return next;
+        const current = periodes.findIndex((p) => today >= p.debut && today <= p.fin);
+        return current !== -1 ? current : periodes.length - 1;
+    }, [periodes]);
+
+    const indexCourant = periodeIndex ?? periodeParDefaut;
+    const periode = indexCourant !== null ? periodes[indexCourant] ?? null : null;
+    // Period mode only once a period is actually readable; otherwise the week view, unchanged.
+    const periodMode = Boolean(periode);
+
     const periodStart = useMemo(
-        () => addDays(weekStart(new Date()), weekOffset * 7),
-        [weekOffset],
+        () => (periode ? periode.debut : addDays(weekStart(new Date()), weekOffset * 7)),
+        [periode, weekOffset],
     );
-    const numDays = numWeeks * 7;
+    const numDays = periode ? dayDiff(periode.debut, periode.fin) + 1 : numWeeks * 7;
     const days = useMemo(
         () => Array.from({length: numDays}, (_, i) => addDays(periodStart, i)),
         [periodStart, numDays],
@@ -373,42 +473,103 @@ function AvailabilityMatrixApp() {
 
     const periodEnd = days[days.length - 1];
 
+    // Plain value, not a hook: it sits after the early returns above, where a hook would change
+    // the call order between renders.
+    const statutRemise = (() => {
+        if (!periode) return {close: false, texte: ''};
+        if (!periode.limite) {
+            return {
+                close: false,
+                texte: 'Aucune date limite renseignée pour cette période : impossible de dire si ces disponibilités sont définitives.',
+            };
+        }
+        const quand = periode.limite.toLocaleString('fr-CA', {
+            weekday: 'long',
+            day: 'numeric',
+            month: 'long',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false,
+            timeZone: 'America/Toronto',
+        });
+        return Date.now() >= periode.limite.getTime()
+            ? {
+                close: true,
+                texte: `Remise close le ${quand} : ces disponibilités sont figées, l’horaire peut être monté.`,
+            }
+            : {
+                close: false,
+                texte: `Remise ouverte jusqu’au ${quand} : les disponibilités peuvent encore changer.`,
+            };
+    })();
+
     return (
         <div className="p-3 text-xs text-gray-gray900 dark:text-gray-gray100">
             <div className="mb-3 flex flex-wrap items-center gap-2">
-                <button
-                    type="button"
-                    onClick={() => setWeekOffset(weekOffset - 1)}
-                    className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700"
-                >
-                    ← Semaine précédente
-                </button>
-                <button
-                    type="button"
-                    onClick={() => setWeekOffset(0)}
-                    className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700"
-                >
-                    Aujourd’hui
-                </button>
-                <button
-                    type="button"
-                    onClick={() => setWeekOffset(weekOffset + 1)}
-                    className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700"
-                >
-                    Semaine suivante →
-                </button>
+                {periodMode ? (
+                    <>
+                        <button
+                            type="button"
+                            onClick={() => setPeriodeIndex(indexCourant - 1)}
+                            disabled={indexCourant <= 0}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            ← Période précédente
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setPeriodeIndex(null)}
+                            disabled={periodeIndex === null}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            Période à planifier
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setPeriodeIndex(indexCourant + 1)}
+                            disabled={indexCourant >= periodes.length - 1}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            Période suivante →
+                        </button>
+                    </>
+                ) : (
+                    <>
+                        <button
+                            type="button"
+                            onClick={() => setWeekOffset(weekOffset - 1)}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            ← Semaine précédente
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setWeekOffset(0)}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            Aujourd’hui
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setWeekOffset(weekOffset + 1)}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 hover:bg-gray-gray100 dark:border-gray-gray600 dark:hover:bg-gray-gray700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            Semaine suivante →
+                        </button>
 
-                <select
-                    value={numWeeks}
-                    onChange={(e) => setNumWeeks(Number(e.target.value))}
-                    className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 dark:border-gray-gray600 dark:bg-gray-gray800"
-                >
-                    {WEEK_OPTIONS.map((n) => (
-                        <option key={n} value={n}>
-                            {n} semaine{n > 1 ? 's' : ''}
-                        </option>
-                    ))}
-                </select>
+                        <select
+                            value={numWeeks}
+                            onChange={(e) => setNumWeeks(Number(e.target.value))}
+                            className="cursor-pointer rounded border border-gray-gray300 px-2 py-1 dark:border-gray-gray600 dark:bg-gray-gray800"
+                        >
+                            {WEEK_OPTIONS.map((n) => (
+                                <option key={n} value={n}>
+                                    {n} semaine{n > 1 ? 's' : ''}
+                                </option>
+                            ))}
+                        </select>
+                    </>
+                )}
 
                 <label className="flex cursor-pointer items-center gap-1">
                     <input
@@ -421,8 +582,26 @@ function AvailabilityMatrixApp() {
                 </label>
             </div>
 
+            {/* Whether the numbers below are final. The same table means two different things
+                depending on the deadline: before it, a snapshot that can still move; after it, the
+                frozen availabilities the schedule has to be built from. */}
+            {periodMode && (
+                <div
+                    className={
+                        'mb-3 rounded border px-3 py-2 text-center ' +
+                        (statutRemise.close
+                            ? 'border-green-green bg-green-greenLight2 text-gray-gray900'
+                            : 'border-yellow-yellow bg-yellow-yellowLight2 text-gray-gray900')
+                    }
+                >
+                    {statutRemise.texte}
+                </div>
+            )}
+
             <h1 className="mb-3 text-center font-display text-base font-semibold">
-                Disponibilités du {fmtDate(periodStart)} au {fmtDate(periodEnd)}
+                {periodMode
+                    ? `Disponibilités du ${jourLong(periodStart)} au ${jourLong(periodEnd, true)}`
+                    : `Disponibilités du ${fmtDate(periodStart)} au ${fmtDate(periodEnd)}`}
             </h1>
 
             <div className="overflow-x-auto">
